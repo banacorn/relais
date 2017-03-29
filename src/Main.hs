@@ -26,7 +26,6 @@ forkM f = do
 data State = State
     {   socketVar :: MVar Socket
     ,   connectionVar :: MVar Socket
-    ,   messageChan :: Chan ByteString
     }
 
 type M = ReaderT State IO
@@ -35,8 +34,7 @@ genDefaultState :: IO State
 genDefaultState = do
     s <- newEmptyMVar
     c <- newEmptyMVar
-    m <- newChan
-    return $ State s c m
+    return $ State s c
 
 get :: (State -> MVar Socket) -> M Socket
 get selector = asks selector >>= liftIO . readMVar
@@ -86,119 +84,116 @@ disconnect = do
 isConnected :: M Bool
 isConnected = asks connectionVar >>= liftIO . fmap not . isEmptyMVar
 
-getMessage :: M ByteString
-getMessage = asks messageChan >>= liftIO . readChan
-
 type Session = ReaderT Socket M
 
 main :: IO ()
 main = do
     defaultState <- genDefaultState
-    runReaderT prog defaultState
-
-prog :: M ()
-prog = do
-    repl
+    runReaderT repl defaultState
 
 data Action = Noop | Start | Stop | Kill | Info deriving (Show)
 
 parseAction :: String -> Maybe Action
 parseAction "" = Just Noop
-parseAction "start" = Just Start
-parseAction "stop" = Just Stop
-parseAction "kill" = Just Kill
-parseAction "info" = Just Info
+parseAction "s" = Just Start
+parseAction "q" = Just Stop
+parseAction "k" = Just Kill
+parseAction "i" = Just Info
 parseAction _ = Nothing
 
+printNewline :: M ()
+printNewline = liftIO $ putStrLn ""
 
-repl :: M ()
-repl = do
+printPrompt :: M ()
+printPrompt = do
     bound <- isBound
     connected <- isConnected
     -- display the prompt
     liftIO $ if bound
-        then putStr "*"
+        then putStr "@"
         else putStr " "
     liftIO $ if connected
-        then putStr "-*"
-        else putStr "  "
+        then putStr "*"
+        else putStr " "
     liftIO $ putStr " > "
 
+printInfo :: M ()
+printInfo = do
+    bound <- isBound
+    connected <- isConnected
+    liftIO $ putStrLn "          connected   bound   listening   readable   writable"
+    liftIO $ putStr " server   "
+    if bound
+        then do
+            sock <- get socketVar
+            liftIO $ do
+                Net.isConnected sock >>= putStr . star >> putStr "           "
+                Net.isBound sock >>= putStr . star >> putStr "       "
+                Net.isListening sock >>= putStr . star >> putStr "           "
+                Net.isReadable sock >>= putStr . star >> putStr "          "
+                Net.isWritable sock >>= putStr . star
+        else return ()
+    liftIO $ putStr "\n"
+
+    liftIO $ putStr " client   "
+    if connected
+        then do
+            conn <- get connectionVar
+            liftIO $ do
+                Net.isConnected conn >>= putStr . star >> putStr "           "
+                Net.isBound conn >>= putStr . star >> putStr "       "
+                Net.isListening conn >>= putStr . star >> putStr "           "
+                Net.isReadable conn >>= putStr . star >> putStr "          "
+                Net.isWritable conn >>= putStr . star
+        else return ()
+    liftIO $ putStr "\n"
+    where
+        star :: Bool -> String
+        star True = "*"
+        star False = " "
+
+repl :: M ()
+repl = do
+    printPrompt
     -- read
     str <- liftIO getLine
     case parseAction str of
         Just Noop -> liftIO $ putStr ""
         Just Start -> void $ do
             bind
-            forkM $ do
-                sock <- get socketVar
-                (conn, _) <- liftIO $ Net.accept sock
-                set connectionVar conn
-                loop conn
-                return ()
+            forkM accept
         Just Stop -> do
             disconnect
             unbind
-            return ()
-        Just Kill -> liftIO $ putStr "kill"
-        Just Info -> do
-            liftIO $ putStrLn "          connected   bound   listening   readable   writable"
-            liftIO $ putStr " server   "
-            if bound
-                then do
-                    sock <- get socketVar
-                    liftIO $ do
-                        Net.isConnected sock >>= putStr . star >> putStr "           "
-                        Net.isBound sock >>= putStr . star >> putStr "       "
-                        Net.isListening sock >>= putStr . star >> putStr "           "
-                        Net.isReadable sock >>= putStr . star >> putStr "          "
-                        Net.isWritable sock >>= putStr . star
-                else return ()
-            liftIO $ putStr "\n"
-
-            liftIO $ putStr " client   "
-            if connected
-                then do
-                    conn <- get connectionVar
-                    liftIO $ do
-                        Net.isConnected conn >>= putStr . star >> putStr "           "
-                        Net.isBound conn >>= putStr . star >> putStr "       "
-                        Net.isListening conn >>= putStr . star >> putStr "           "
-                        Net.isReadable conn >>= putStr . star >> putStr "          "
-                        Net.isWritable conn >>= putStr . star
-                else return ()
-            liftIO $ putStr "\n"
-            --         putStrLn
-            return ()
+        Just Kill -> do
+            disconnect
+        Just Info -> printInfo
         Nothing -> liftIO $ putStrLn $ "cannot read: " <> str
     repl
 
-    where
-        star :: Bool -> String
-        star True = "*"
-        star False = " "
+accept :: M ()
+accept = do
+    sock <- get socketVar
+    (conn, _) <- liftIO $ Net.accept sock
+    set connectionVar conn
+    printNewline
+    printPrompt
+    loop conn
+    accept
 
 loop :: Socket -> M ()
 loop conn = do
     msg <- liftIO $ recv conn 1024
     let disconnected = S.null msg
-    if disconnected
+    killed <- fmap not isConnected
+    if disconnected || killed
         then do
-            liftIO $ putStrLn "[0]"
             disconnect
+            printNewline
+            printPrompt
             return ()
         else do
             -- liftIO $ sendAll conn msg
             liftIO $ C.putStr $ "[" <> C.pack (show $ S.length msg) <> "] " <> msg
+            printPrompt
             loop conn
-
--- loop :: Socket -> MVar Status -> IO ()
--- loop conn var = do
---     status <- readMVar var
---     msg <- recv conn 1024
---     sendAll conn msg
---     C.putStrLn $ C.pack (show status) <> " > " <> msg
---     if msg == "bye\r\n" || msg == "" || status == False
---         then close conn
---         else loop conn var
---
